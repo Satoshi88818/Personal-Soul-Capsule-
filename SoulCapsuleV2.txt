@@ -1,0 +1,353 @@
+#!/usr/bin/env python3
+"""
+SoulCapsule v2 — A Personal Multimodal Memory Vault
+Simple. Beautiful. Alive.
+
+Stores your life's moments with text, images, audio, mood, and vague senses.
+Searches semantically. Feels human.
+
+No SNNs. No killswitches. No fake sentience.
+Just meaning, emotion, and memory.
+
+Run: python soulcapsule.py
+"""
+
+import os
+import uuid
+import json
+import sqlite3
+import hashlib
+from datetime import datetime
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Tuple
+
+import numpy as np
+import faiss
+from sentence_transformers import SentenceTransformer
+from PIL import Image
+import clip
+import torch
+import torchaudio
+from pydub import AudioSegment
+import argparse
+
+# =============================================================================
+# Configuration
+# =============================================================================
+
+CONFIG = {
+    "db_path": Path("soulcapsule.db"),
+    "index_path": Path("soulcapsule.faiss"),
+    "dimension": 384,
+    "model_name": "all-MiniLM-L6-v2",
+    "clip_model": "ViT-B/32",
+    "batch_size": 32,
+    "max_search_results": 10,
+}
+
+# Create directories
+CONFIG["db_path"].parent.mkdir(exist_ok=True)
+CONFIG["index_path"].parent.mkdir(exist_ok=True)
+
+# =============================================================================
+# Core Models (Lazy Loaded)
+# =============================================================================
+
+class SoulModels:
+    _text_model = None
+    _clip_model = None
+    _clip_preprocess = None
+    _device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    @classmethod
+    def text_model(cls):
+        if cls._text_model is None:
+            print("Loading text embedding model...")
+            cls._text_model = SentenceTransformer(CONFIG["model_name"])
+        return cls._text_model
+
+    @classmethod
+    def clip_model(cls):
+        if cls._clip_model is None:
+            print("Loading CLIP model...")
+            model, preprocess = clip.load(CONFIG["clip_model"], device=cls._device)
+            cls._clip_model = model
+            cls._clip_preprocess = preprocess
+        return cls._clip_model, cls._clip_preprocess
+
+
+# =============================================================================
+# Database & Index
+# =============================================================================
+
+def init_db():
+    conn = sqlite3.connect(CONFIG["db_path"])
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS memories (
+            id TEXT PRIMARY KEY,
+            text TEXT,
+            image_path TEXT,
+            audio_path TEXT,
+            mood TEXT,
+            intensity REAL,
+            tags TEXT,
+            metadata TEXT,
+            timestamp TEXT,
+            embedding BLOB
+        )
+    """)
+    cur.execute("CREATE INDEX IF NOT EXISTS idx_time ON memories(timestamp)")
+    conn.commit()
+    conn.close()
+
+def load_index() -> faiss.IndexFlatL2:
+    if CONFIG["index_path"].exists():
+        print("Loading FAISS index...")
+        return faiss.read_index(str(CONFIG["index_path"]))
+    else:
+        print("Creating new FAISS index...")
+        return faiss.IndexFlatL2(CONFIG["dimension"])
+
+def save_index(index: faiss.IndexFlatL2):
+    faiss.write_index(index, str(CONFIG["index_path"]))
+
+# =============================================================================
+# Embedding Functions
+# =============================================================================
+
+def embed_text(text: str) -> np.ndarray:
+    if not text.strip():
+        text = "empty memory"
+    vec = SoulModels.text_model().encode(text, convert_to_numpy=True, normalize_embeddings=True)
+    return vec.astype(np.float32)
+
+def embed_image(image_path: str) -> Optional[np.ndarray]:
+    if not image_path or not Path(image_path).exists():
+        return None
+    try:
+        image = Image.open(image_path).convert("RGB")
+        model, preprocess = SoulModels.clip_model()
+        with torch.no_grad():
+            vec = model.encode_image(preprocess(image).unsqueeze(0).to(SoulModels._device))
+            vec = vec.cpu().numpy().flatten()
+            vec = vec / np.linalg.norm(vec)
+            # Resize to our dimension
+            if vec.shape[0] != CONFIG["dimension"]:
+                vec = np.resize(vec, CONFIG["dimension"])
+                vec = vec / np.linalg.norm(vec)
+            return vec.astype(np.float32)
+    except Exception as e:
+        print(f"Image embedding failed: {e}")
+        return None
+
+def embed_audio(audio_path: str) -> Optional[np.ndarray]:
+    if not audio_path or not Path(audio_path).exists():
+        return None
+    try:
+        # Load with pydub → convert → torch
+        audio = AudioSegment.from_file(audio_path)
+        audio = audio.set_channels(1).set_frame_rate(16000)
+        samples = np.array(audio.get_array_of_samples()).astype(np.float32)
+        samples = samples / (2**15)  # normalize
+
+        # Use text model on a fake description (good enough)
+        desc = f"audio voice note {'calm' if audio.dBFS < -20 else 'loud'} {'long' if len(samples) > 16000*10 else 'short'}"
+        return embed_text(desc)
+    except Exception as e:
+        print(f"Audio embedding failed: {e}")
+        return None
+
+def combine_embeddings(text_emb: np.ndarray, image_emb=None, audio_emb=None) -> np.ndarray:
+    weights = [1.0]  # text always
+    embs = [text_emb]
+
+    if image_emb is not None:
+        weights.append(0.6)
+        embs.append(image_emb)
+    if audio_emb is not None:
+        weights.append(0.4)
+        embs.append(audio_emb)
+
+    total_weight = sum(weights)
+    final = np.zeros(CONFIG["dimension"], dtype=np.float32)
+    for w, e in zip(weights, embs):
+        final += w * e
+    final = final / total_weight
+    final = final / np.linalg.norm(final + 1e-8)
+    return final
+
+# =============================================================================
+# Memory Storage
+# =============================================================================
+
+INDEX = load_index()
+
+def add_memory(
+    text: str,
+    image_path: Optional[str] = None,
+    audio_path: Optional[str] = None,
+    mood: Optional[str] = None,
+    tags: Optional[str] = None,
+    intensity: float = 1.0
+) -> str:
+    memory_id = str(uuid.uuid4())
+    timestamp = datetime.now().isoformat()
+
+    # Enrich text
+    full_text = text
+    if tags:
+        full_text += " " + " ".join([f"#{t.strip()}" for t in tags.split(",")])
+    if mood:
+        full_text += f" feeling:{mood}"
+
+    # Embeddings
+    text_emb = embed_text(full_text)
+    image_emb = embed_image(image_path) if image_path else None
+    audio_emb = embed_audio(audio_path) if audio_path else None
+    final_emb = combine_embeddings(text_emb, image_emb, audio_emb)
+
+    # Save to DB
+    conn = sqlite3.connect(CONFIG["db_path"])
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO memories 
+        (id, text, image_path, audio_path, mood, intensity, tags, metadata, timestamp, embedding)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    """, (
+        memory_id,
+        text,
+        image_path,
+        audio_path,
+        mood or "neutral",
+        intensity,
+        tags or "",
+        json.dumps({"source": "user"}),
+        timestamp,
+        final_emb.tobytes()
+    ))
+    conn.commit()
+    conn.close()
+
+    # Add to index
+    global INDEX
+    if INDEX.ntotal == 0:
+        INDEX = faiss.IndexFlatL2(CONFIG["dimension"])
+    INDEX.add(np.array([final_emb]))
+    save_index(INDEX)
+
+    print(f"Memory captured. ID: {memory_id[:8]}")
+    return memory_id
+
+# =============================================================================
+# Search & Recall
+# =============================================================================
+
+def search_memories(
+    query: str,
+    k: int = 10,
+    mood_filter: Optional[str] = None
+) -> List[Dict[str, Any]]:
+    query_emb = embed_text(query)
+    distances, indices = INDEX.search(np.array([query_emb]), k * 2)
+
+    conn = sqlite3.connect(CONFIG["db_path"])
+    cur = conn.cursor()
+
+    results = []
+    seen = set()
+    for dist, idx in zip(distances[0], indices[0]):
+        if idx < 0 or idx in seen:
+            continue
+        cur.execute("SELECT * FROM memories WHERE rowid = ?", (idx + 1,))
+        row = cur.fetchone()
+        if not row:
+            continue
+
+        cols = [d[0] for d in cur.description]
+        mem = dict(zip(cols, row))
+        mem["similarity"] = float(1 - dist)
+
+        if mood_filter and mem["mood"] != mood_filter:
+            continue
+
+        # Decode embedding
+        emb = np.frombuffer(mem["embedding"], dtype=np.float32)
+        mem["resonance"] = mem["intensity"] * mem["similarity"] * (1 + 0.1 * len(mem["text"].split()))
+
+        results.append(mem)
+        seen.add(idx)
+        if len(results) >= k:
+            break
+
+    conn.close()
+    results.sort(key=lambda x: x["resonance"], reverse=True)
+    return results
+
+def print_results(results: List[Dict]):
+    print("\nYour memories resonate...\n" + "─" * 50)
+    for r in results:
+        date = r["timestamp"].split("T")[0]
+        mood = r["mood"]
+        sim = r["similarity"]
+        text = r["text"][:140] + "..." if len(r["text"]) > 140 else r["text"]
+        print(f"{date} | {mood.upper():<8} | {sim:.3f} | {text}")
+        if r["image_path"]:
+            print(f"   photo: {r['image_path']}")
+        if r["audio_path"]:
+            print(f"   audio: {r['audio_path']}")
+        print()
+
+# =============================================================================
+# CLI Interface
+# =============================================================================
+
+def cli():
+    parser = argparse.ArgumentParser(description="SoulCapsule — Your Digital Soul")
+    sub = parser.add_subparsers(dest="cmd")
+
+    # Add memory
+    add = sub.add_parser("add", help="Add a new memory")
+    add.add_argument("text", help="What happened?")
+    add.add_argument("--image", "-i", help="Path to image")
+    add.add_argument("--audio", "-a", help="Path to audio")
+    add.add_argument("--mood", "-m", choices=["joy","sadness","anger","fear","love","calm","excitement","nostalgia"], help="How did you feel?")
+    add.add_argument("--tags", "-t", help="comma,separated,tags")
+    add.add_argument("--intensity", type=float, default=1.0, help="How strong? (0.1–2.0)")
+
+    # Search
+    search = sub.add_parser("search", help="Search your soul")
+    search.add_argument("query", help="What are you looking for?")
+    search.add_argument("--mood", help="Only memories with this mood")
+    search.add_argument("-n", type=int, default=CONFIG["max_search_results"], help="Number of results")
+
+    args = parser.parse_args()
+
+    if args.cmd == "add":
+        add_memory(
+            text=args.text,
+            image_path=args.image,
+            audio_path=args.audio,
+            mood=args.mood,
+            tags=args.tags,
+            intensity=max(0.1, min(2.0, args.intensity))
+        )
+
+    elif args.cmd == "search":
+        results = search_memories(args.query, k=args.n, mood_filter=args.mood)
+        print_results(results)
+
+    else:
+        print("SoulCapsule — Your memories, forever.")
+        print("Usage:")
+        print("  soulcapsule.py add 'I kissed her under the rain' --mood love --image rain.jpg")
+        print("  soulcapsule.py search 'first time I felt truly alive'")
+        print("  soulcapsule.py search 'Paris' --mood joy")
+
+# =============================================================================
+# Entry Point
+# =============================================================================
+
+if __name__ == "__main__":
+    init_db()
+    cli()
